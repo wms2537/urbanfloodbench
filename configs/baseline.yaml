@@ -1,0 +1,41 @@
+# Baseline CL-DTS Configuration
+# Phase B: Deterministic coupled GraphGRU
+
+# Data
+data_dir: "data"
+batch_size: 4
+seq_len: 16
+pred_len: 1
+stride: 4
+val_ratio: 0.2
+num_workers: 4
+
+# Model Architecture
+hidden_dim: 64
+latent_dim: 32
+event_latent_dim: 16
+num_gnn_layers: 3
+num_temporal_layers: 2
+use_attention: true
+use_event_latent: true
+use_dynamic_latent: false  # Phase C: enable this
+dropout: 0.1
+
+# Graph Construction
+coupling_k: 3
+add_knn_2d: false
+knn_k: 8
+
+# Training
+learning_rate: 0.001
+weight_decay: 0.00001
+beta: 0.1
+rollout_steps: 8
+max_epochs: 50
+patience: 10
+prefix_len: 8
+
+# System
+accelerator: "auto"
+devices: 1
+precision: "32"
