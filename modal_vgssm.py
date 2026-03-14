@@ -229,12 +229,15 @@ def train_vgssm(train_args: str) -> str:
         print(f"Prediction mode: using checkpoint={pred_ckpt}")
     else:
         resolved_ckpt = _resolve_resume_checkpoint(train_tokens)
+        init_ckpt = _get_cli_value(train_tokens, "--init_ckpt")
         if resolved_ckpt is not None:
             _set_cli_value(train_tokens, "--checkpoint", resolved_ckpt)
             print(f"Resolved resume checkpoint: {resolved_ckpt}")
         elif _get_cli_value(train_tokens, "--checkpoint") is not None:
             user_ckpt = _get_cli_value(train_tokens, "--checkpoint")
             print(f"Checkpoint not found, keeping user arg as-is: {user_ckpt}")
+        elif init_ckpt is not None:
+            print(f"No resume checkpoint found; warm-starting from init_ckpt={init_ckpt}")
         else:
             print("No checkpoint provided; training will start from scratch.")
 
