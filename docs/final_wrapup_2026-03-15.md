@@ -134,6 +134,20 @@
    - `submission_20260314_m1v2e07_base_m2_correctedsync_full399_epoch15_calib_poly3.parquet`
    - public score `0.0701`
 
+## Final Deadline Sweep
+- Final last-mile submissions were restricted to low-capacity inference variants around the best corrected-data branch.
+- Tried and scored variants included:
+  - `submission_20260315_m1v2e07_base_m2_blend_poly75_lin25.parquet`
+  - `submission_20260315_m1v2e07_base_m2_hybrid_poly1d_lin2d.parquet`
+  - `submission_20260315_m1v2e07_base_m2_hybrid_lin1d_poly2d.parquet`
+  - `submission_20260315_m1v2e07_base_m2_poly1d_lin2d_tail1d_q12_from180.parquet`
+  - `submission_20260315_m1v2e07_base_m2_poly1d_lin2d_tail1d_c25_from240.parquet`
+- Best outcome of the deadline sweep:
+  - repeated tie at `0.0701`
+- Conclusion:
+  - the inference-calibration family was saturated
+  - additional deadline-hour tweaks did not move the score below `0.0701`
+
 ## Modal End State At Wrap-Up
 - Active Modal app during the final push:
   - `ap-pjC03EdmZl9Rq2NTbo8CrW`
