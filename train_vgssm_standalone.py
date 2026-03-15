@@ -3590,6 +3590,10 @@ class VGSSMTrainer(pl.LightningModule):
         recon_weight_1d=0.5,
         recon_weight_2d=0.5,
         horizon_weight_by_valid_count=False,
+        delta_loss_weight=0.0,
+        bias_loss_weight=0.0,
+        late_horizon_start_frac=0.6,
+        late_horizon_power=2.0,
     ):
         super().__init__()
         self.model = model
@@ -3687,6 +3691,10 @@ class VGSSMTrainer(pl.LightningModule):
         self.future_inlet_keep_prob = future_inlet_keep_prob
         self.recon_balance_mode = recon_balance_mode
         self.horizon_weight_by_valid_count = horizon_weight_by_valid_count
+        self.delta_loss_weight = float(max(delta_loss_weight, 0.0))
+        self.bias_loss_weight = float(max(bias_loss_weight, 0.0))
+        self.late_horizon_start_frac = float(min(max(late_horizon_start_frac, 0.0), 0.99))
+        self.late_horizon_power = float(max(late_horizon_power, 1.0))
 
         rw_1d = max(float(recon_weight_1d), 0.0)
         rw_2d = max(float(recon_weight_2d), 0.0)
@@ -3840,6 +3848,163 @@ class VGSSMTrainer(pl.LightningModule):
             weights = torch.exp(torch.arange(horizon, device=device, dtype=torch.float) * 0.05)
             return weights / weights.sum()
         return torch.ones(horizon, device=device) / horizon
+
+    def _combine_1d_2d_loss(self, loss_1d: torch.Tensor, loss_2d: torch.Tensor) -> torch.Tensor:
+        if self.recon_balance_mode == 'sum':
+            return loss_1d + loss_2d
+        return self.recon_weight_1d * loss_1d + self.recon_weight_2d * loss_2d
+
+    def _apply_valid_counts_to_weights(self, weights: torch.Tensor, target_mask: torch.Tensor) -> torch.Tensor:
+        valid_counts = target_mask.sum(dim=0).to(dtype=weights.dtype, device=weights.device)
+        if self.horizon_weight_by_valid_count:
+            weights = weights * valid_counts
+        else:
+            weights = weights * (valid_counts > 0).to(dtype=weights.dtype, device=weights.device)
+        if weights.sum() > 0:
+            weights = weights / weights.sum()
+        return weights
+
+    def _get_late_horizon_weights(self, horizon: int, device: torch.device, target_mask: torch.Tensor) -> torch.Tensor:
+        if horizon <= 1:
+            return torch.ones(horizon, device=device, dtype=torch.float)
+        x = torch.linspace(0.0, 1.0, horizon, device=device, dtype=torch.float)
+        late = ((x - self.late_horizon_start_frac) / max(1e-6, 1.0 - self.late_horizon_start_frac)).clamp(min=0.0)
+        late = late.pow(self.late_horizon_power)
+        return self._apply_valid_counts_to_weights(late, target_mask)
+
+    def _compute_delta_targets(
+        self,
+        target_1d: torch.Tensor,
+        target_2d: torch.Tensor,
+        input_1d: torch.Tensor,
+        input_2d: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        start_1d = input_1d[:, -1, :, 0]
+        start_2d = input_2d[:, -1, :, 1]
+        prev_1d = torch.cat([start_1d.unsqueeze(1), target_1d[:, :-1]], dim=1)
+        prev_2d = torch.cat([start_2d.unsqueeze(1), target_2d[:, :-1]], dim=1)
+        return target_1d - prev_1d, target_2d - prev_2d
+
+    def _masked_abs_bias(self, pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        mask = mask.to(dtype=pred.dtype, device=pred.device)
+        while mask.dim() < pred.dim():
+            mask = mask.unsqueeze(-1)
+        if mask.shape != pred.shape:
+            mask = mask.expand_as(pred)
+        valid = mask.sum()
+        if valid <= 0:
+            return torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
+        bias = ((pred - target) * mask).sum() / valid
+        return bias.abs()
+
+    def _compute_stepwise_loss_value(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        target_mask: torch.Tensor,
+        step_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        mask = target_mask.to(dtype=pred.dtype, device=pred.device).unsqueeze(-1).expand_as(pred)
+        if self.loss_type == 'huber':
+            loss_elem = F.huber_loss(pred, target, delta=self.huber_delta, reduction='none')
+        else:
+            loss_elem = (pred - target) ** 2
+        numer = (loss_elem * mask).sum(dim=(0, 2))
+        denom = mask.sum(dim=(0, 2))
+        per_step = torch.where(denom > 0, numer / denom.clamp_min(1.0), torch.zeros_like(numer))
+        return (per_step * step_weights).sum()
+
+    def _compute_stepwise_abs_bias_value(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        target_mask: torch.Tensor,
+        step_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        mask = target_mask.to(dtype=pred.dtype, device=pred.device).unsqueeze(-1).expand_as(pred)
+        numer = ((pred - target) * mask).sum(dim=(0, 2))
+        denom = mask.sum(dim=(0, 2))
+        per_step = torch.where(denom > 0, numer / denom.clamp_min(1.0), torch.zeros_like(numer))
+        return (per_step.abs() * step_weights).sum()
+
+    def _compute_rollout_regularizers(
+        self,
+        pred_1d: torch.Tensor,
+        pred_2d: torch.Tensor,
+        target_1d: torch.Tensor,
+        target_2d: torch.Tensor,
+        target_mask: torch.Tensor,
+        input_1d: torch.Tensor,
+        input_2d: torch.Tensor,
+        pred_delta_1d: Optional[torch.Tensor] = None,
+        pred_delta_2d: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        horizon = min(pred_1d.shape[1], target_1d.shape[1], target_mask.shape[1])
+        device = pred_1d.device
+        zero = torch.tensor(0.0, device=device, dtype=pred_1d.dtype)
+        if horizon <= 0:
+            return {
+                'delta_loss_1d': zero,
+                'delta_loss_2d': zero,
+                'delta_loss': zero,
+                'bias_loss_1d': zero,
+                'bias_loss_2d': zero,
+                'bias_loss': zero,
+            }
+
+        pred_1d = pred_1d[:, :horizon]
+        pred_2d = pred_2d[:, :horizon]
+        target_1d = target_1d[:, :horizon]
+        target_2d = target_2d[:, :horizon]
+        target_mask = target_mask[:, :horizon]
+
+        step_weights = self._apply_valid_counts_to_weights(self._get_horizon_weights(horizon, device), target_mask)
+        late_weights = self._get_late_horizon_weights(horizon, device, target_mask)
+
+        if pred_delta_1d is None:
+            start_1d = input_1d[:, -1, :, 0]
+            pred_prev_1d = torch.cat([start_1d.unsqueeze(1), pred_1d[:, :-1]], dim=1)
+            pred_delta_1d = pred_1d - pred_prev_1d
+        else:
+            pred_delta_1d = pred_delta_1d[:, :horizon]
+
+        if pred_delta_2d is None:
+            start_2d = input_2d[:, -1, :, 1]
+            pred_prev_2d = torch.cat([start_2d.unsqueeze(1), pred_2d[:, :-1]], dim=1)
+            pred_delta_2d = pred_2d - pred_prev_2d
+        else:
+            pred_delta_2d = pred_delta_2d[:, :horizon]
+
+        target_delta_1d, target_delta_2d = self._compute_delta_targets(
+            target_1d=target_1d,
+            target_2d=target_2d,
+            input_1d=input_1d,
+            input_2d=input_2d,
+        )
+        target_delta_1d = target_delta_1d[:, :horizon]
+        target_delta_2d = target_delta_2d[:, :horizon]
+
+        delta_loss_1d = zero
+        delta_loss_2d = zero
+        bias_loss_1d = zero
+        bias_loss_2d = zero
+
+        if self.delta_loss_weight > 0 and step_weights.sum() > 0:
+            delta_loss_1d = self._compute_stepwise_loss_value(pred_delta_1d, target_delta_1d, target_mask, step_weights)
+            delta_loss_2d = self._compute_stepwise_loss_value(pred_delta_2d, target_delta_2d, target_mask, step_weights)
+
+        if self.bias_loss_weight > 0 and late_weights.sum() > 0:
+            bias_loss_1d = self._compute_stepwise_abs_bias_value(pred_1d, target_1d, target_mask, late_weights)
+            bias_loss_2d = self._compute_stepwise_abs_bias_value(pred_2d, target_2d, target_mask, late_weights)
+
+        return {
+            'delta_loss_1d': delta_loss_1d,
+            'delta_loss_2d': delta_loss_2d,
+            'delta_loss': self._combine_1d_2d_loss(delta_loss_1d, delta_loss_2d),
+            'bias_loss_1d': bias_loss_1d,
+            'bias_loss_2d': bias_loss_2d,
+            'bias_loss': self._combine_1d_2d_loss(bias_loss_1d, bias_loss_2d),
+        }
 
     def _kl_z0(self, mu, logvar, free_bits=0.0):
         kl_per_dim = 0.5 * (-1 - logvar + mu.pow(2) + logvar.exp())
@@ -4154,36 +4319,14 @@ class VGSSMTrainer(pl.LightningModule):
         if rollout_len is not None and rollout_len < horizon:
             target_mask[:, rollout_len:] = 0.0
 
-        horizon_weights = self._get_horizon_weights(horizon, pred_1d.device)
-        valid_counts = target_mask.sum(dim=0).to(dtype=horizon_weights.dtype, device=horizon_weights.device)
-        if self.horizon_weight_by_valid_count:
-            horizon_weights = horizon_weights * valid_counts
-        else:
-            valid_steps = (valid_counts > 0).to(dtype=horizon_weights.dtype, device=horizon_weights.device)
-            horizon_weights = horizon_weights * valid_steps
-        if horizon_weights.sum() > 0:
-            horizon_weights = horizon_weights / horizon_weights.sum()
+        horizon_weights = self._apply_valid_counts_to_weights(
+            self._get_horizon_weights(horizon, pred_1d.device),
+            target_mask,
+        )
 
-        losses_1d = []
-        losses_2d = []
-        for h in range(horizon):
-            if target_mask[:, h].sum() <= 0:
-                continue
-            loss_1d_h = self._compute_loss(pred_1d[:, h], target_1d[:, h], mask=target_mask[:, h])
-            loss_2d_h = self._compute_loss(pred_2d[:, h], target_2d[:, h], mask=target_mask[:, h])
-            losses_1d.append(loss_1d_h * horizon_weights[h])
-            losses_2d.append(loss_2d_h * horizon_weights[h])
-
-        if losses_1d:
-            loss_recon_1d = torch.stack(losses_1d).sum()
-            loss_recon_2d = torch.stack(losses_2d).sum()
-        else:
-            loss_recon_1d = torch.tensor(0.0, device=pred_1d.device, dtype=pred_1d.dtype)
-            loss_recon_2d = torch.tensor(0.0, device=pred_1d.device, dtype=pred_1d.dtype)
-        if self.recon_balance_mode == 'sum':
-            loss_recon = loss_recon_1d + loss_recon_2d
-        else:
-            loss_recon = self.recon_weight_1d * loss_recon_1d + self.recon_weight_2d * loss_recon_2d
+        loss_recon_1d = self._compute_stepwise_loss_value(pred_1d, target_1d, target_mask, horizon_weights)
+        loss_recon_2d = self._compute_stepwise_loss_value(pred_2d, target_2d, target_mask, horizon_weights)
+        loss_recon = self._combine_1d_2d_loss(loss_recon_1d, loss_recon_2d)
 
         kl_anneal = min(1.0, self.current_epoch / max(1, self.warmup_epochs))
 
@@ -4204,6 +4347,28 @@ class VGSSMTrainer(pl.LightningModule):
         kl_z0_weight = kl_anneal * self.beta_z
 
         total_loss = loss_recon + kl_ce_weight * kl_ce + kl_z0_weight * kl_z0
+
+        pred_delta_1d = outputs.get('delta_1d')
+        pred_delta_2d = outputs.get('delta_2d')
+        if pred_delta_1d is not None:
+            pred_delta_1d = pred_delta_1d[..., 0][:, :horizon]
+        if pred_delta_2d is not None:
+            pred_delta_2d = pred_delta_2d[..., 0][:, :horizon]
+        rollout_regs = self._compute_rollout_regularizers(
+            pred_1d=pred_1d,
+            pred_2d=pred_2d,
+            target_1d=target_1d,
+            target_2d=target_2d,
+            target_mask=target_mask,
+            input_1d=input_1d,
+            input_2d=input_2d,
+            pred_delta_1d=pred_delta_1d,
+            pred_delta_2d=pred_delta_2d,
+        )
+        if self.delta_loss_weight > 0:
+            total_loss = total_loss + self.delta_loss_weight * rollout_regs['delta_loss']
+        if self.bias_loss_weight > 0:
+            total_loss = total_loss + self.bias_loss_weight * rollout_regs['bias_loss']
 
         # Physics losses with adaptive weighting
         if self.use_physics_loss:
@@ -4287,6 +4452,12 @@ class VGSSMTrainer(pl.LightningModule):
         self.log('train/loss_recon', loss_recon)
         self.log('train/loss_recon_1d', loss_recon_1d)
         self.log('train/loss_recon_2d', loss_recon_2d)
+        self.log('train/delta_loss', rollout_regs['delta_loss'])
+        self.log('train/delta_loss_1d', rollout_regs['delta_loss_1d'])
+        self.log('train/delta_loss_2d', rollout_regs['delta_loss_2d'])
+        self.log('train/late_bias_loss', rollout_regs['bias_loss'])
+        self.log('train/late_bias_loss_1d', rollout_regs['bias_loss_1d'])
+        self.log('train/late_bias_loss_2d', rollout_regs['bias_loss_2d'])
         self.log('train/kl_ce', kl_ce)
         self.log('train/kl_z0', kl_z0)
         self.log('train/future_inlet_used', float(future_inlet_flow_for_model is not None))
@@ -4295,6 +4466,9 @@ class VGSSMTrainer(pl.LightningModule):
         self.log('train/recon_weight_2d', float(self.recon_weight_2d))
         self.log('train/recon_balance_sum_mode', float(self.recon_balance_mode == 'sum'))
         self.log('train/horizon_weight_by_valid_count', float(self.horizon_weight_by_valid_count))
+        self.log('train/delta_loss_weight', float(self.delta_loss_weight))
+        self.log('train/bias_loss_weight', float(self.bias_loss_weight))
+        self.log('train/late_horizon_start_frac', float(self.late_horizon_start_frac))
 
         if self.use_curriculum and self.curriculum_scheduler is not None:
             self.log('train/rollout_len', float(self.curriculum_scheduler.current_rollout_len))
@@ -4369,6 +4543,24 @@ class VGSSMTrainer(pl.LightningModule):
         rmse_2d_monitor = rmse_2d_full
         std_rmse_monitor = std_rmse_full
 
+        pred_delta_1d_eval = outputs_eval.get('delta_1d')
+        pred_delta_2d_eval = outputs_eval.get('delta_2d')
+        if pred_delta_1d_eval is not None:
+            pred_delta_1d_eval = pred_delta_1d_eval[..., 0][:, :full_horizon]
+        if pred_delta_2d_eval is not None:
+            pred_delta_2d_eval = pred_delta_2d_eval[..., 0][:, :full_horizon]
+        rollout_regs = self._compute_rollout_regularizers(
+            pred_1d=pred_1d_full[:, :full_horizon],
+            pred_2d=pred_2d_full[:, :full_horizon],
+            target_1d=target_1d[:, :full_horizon],
+            target_2d=target_2d[:, :full_horizon],
+            target_mask=target_mask_full,
+            input_1d=input_1d,
+            input_2d=input_2d,
+            pred_delta_1d=pred_delta_1d_eval,
+            pred_delta_2d=pred_delta_2d_eval,
+        )
+
         if rollout_len is not None and rollout_len < full_horizon:
             rmse_1d_curr, rmse_2d_curr, std_rmse_curr, _, _ = self._compute_std_rmse(
                 pred_1d_full[:, :rollout_len],
@@ -4419,6 +4611,12 @@ class VGSSMTrainer(pl.LightningModule):
 
         self.log('val/rmse_1d', rmse_1d_monitor)
         self.log('val/rmse_2d', rmse_2d_monitor)
+        self.log('val/delta_loss', rollout_regs['delta_loss'])
+        self.log('val/delta_loss_1d', rollout_regs['delta_loss_1d'])
+        self.log('val/delta_loss_2d', rollout_regs['delta_loss_2d'])
+        self.log('val/late_bias_loss', rollout_regs['bias_loss'])
+        self.log('val/late_bias_loss_1d', rollout_regs['bias_loss_1d'])
+        self.log('val/late_bias_loss_2d', rollout_regs['bias_loss_2d'])
         self.log('val/std_rmse', std_rmse_monitor, prog_bar=True)
         # Mirror metric without '/' so checkpoint filenames don't create nested paths.
         self.log('val_std_rmse', std_rmse_monitor, prog_bar=False)
@@ -4905,6 +5103,14 @@ def parse_args():
                         help='2D reconstruction weight when recon_balance_mode=equal (renormalized with 1D)')
     parser.add_argument('--horizon_weight_by_valid_count', action='store_true',
                         help='Scale horizon weights by number of valid samples at each step (reduces tail-noise over-weighting)')
+    parser.add_argument('--delta_loss_weight', type=float, default=0.0,
+                        help='Weight for rollout delta loss against target water-level increments')
+    parser.add_argument('--bias_loss_weight', type=float, default=0.0,
+                        help='Weight for late-horizon absolute mean-bias penalty')
+    parser.add_argument('--late_horizon_start_frac', type=float, default=0.6,
+                        help='Fraction of horizon after which late-bias penalty ramps in')
+    parser.add_argument('--late_horizon_power', type=float, default=2.0,
+                        help='Power used for the late-horizon bias ramp')
     parser.add_argument('--loss_type', type=str, default='mse')
     parser.add_argument('--warmup_epochs', type=int, default=5)
 
@@ -5284,6 +5490,13 @@ def main():
         print(f"Config: hidden_dim={model_config['hidden_dim']}, latent_dim={model_config['latent_dim']}")
         print(f"        gnn_layers={model_config['num_gnn_layers']}, transition_gnn={model_config['num_transition_gnn_layers']}")
         print(f"Physics: delta={args.use_delta_prediction}, physics_loss={args.use_physics_loss}, curriculum={args.use_curriculum}")
+        print(
+            "Rollout aux losses: "
+            f"delta_loss_weight={args.delta_loss_weight}, "
+            f"bias_loss_weight={args.bias_loss_weight}, "
+            f"late_horizon_start_frac={args.late_horizon_start_frac}, "
+            f"late_horizon_power={args.late_horizon_power}"
+        )
         if args.use_physics_loss:
             print(
                 f"         mode={args.physics_loss_mode}, local_weight={args.physics_local_weight}, "
@@ -5488,6 +5701,10 @@ def main():
             recon_balance_mode=args.recon_balance_mode,
             recon_weight_1d=args.recon_weight_1d,
             recon_weight_2d=args.recon_weight_2d,
+            delta_loss_weight=args.delta_loss_weight,
+            bias_loss_weight=args.bias_loss_weight,
+            late_horizon_start_frac=args.late_horizon_start_frac,
+            late_horizon_power=args.late_horizon_power,
             warmup_epochs=args.warmup_epochs,
             max_epochs=args.max_epochs,
             norm_stats=norm_stats,
